@@ -23,6 +23,9 @@ args: display, img_topic, camera, save_results, video_path frame_interval, servi
 
 class VideoTracker(object):
     def __init__(self):
+        self.detection_id_increment = rospy.get_param('~detection_id_increment', 1)
+        self.last_detection_id = rospy.get_param('~detection_id_offset', 0)
+
         # initialize publishers
         self.image_pub = rospy.Publisher("~image/compressed", CompressedImage, queue_size=1)
         self.spencer_pub = rospy.Publisher("~detected_persons", DetectedPersons, queue_size=1)
@@ -63,10 +66,10 @@ class VideoTracker(object):
         else:
             return False
 
-    def to_spencer_msg(self, detections, points, shape):
+    def to_spencer_msg(self, detections, cls_conf, points, shape):
         persons = DetectedPersons()
-        width, height = shape[:2]
-        for p in detections:
+        height, width = shape[:2]
+        for p, conf in zip(detections, cls_conf):
             tlwh = self.deepsort._xyxy_to_tlwh(p[:4])
             x, y = int(tlwh[0] + tlwh[2] / 2), int(tlwh[1] + tlwh[3] / 2)
             centers = [[xx, yy] for yy in range(max(y - 3, 0), min(y + 3, height))
@@ -78,8 +81,10 @@ class VideoTracker(object):
             person.pose.pose.position.x = pt[0]
             person.pose.pose.position.y = pt[1]
             person.pose.pose.position.z = pt[2]
-            person.confidence = 0.5
-            person.detection_id = p[-1]
+            person.confidence = conf
+            person.reidentification_id = p[-1]
+            person.detection_id = self.last_detection_id
+            self.last_detection_id += self.detection_id_increment
             large_var = 999999999
             pose_variance = 0.05
             person.pose.covariance[0 * 6 + 0] = pose_variance
@@ -188,7 +193,7 @@ class VideoTracker(object):
         self.image_pub.publish(msg)
 
         """publishing to topics"""
-        msg = self.to_spencer_msg(outputs, points, im.shape)
+        msg = self.to_spencer_msg(outputs, cls_conf, points, im.shape)
         msg.header = points.header
         self.spencer_pub.publish(msg)
 
