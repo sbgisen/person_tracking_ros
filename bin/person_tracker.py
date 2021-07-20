@@ -102,7 +102,7 @@ class VideoTracker(object):
         if self.deepsort is None:
             # Only construct instance.
             rospy.loginfo('loading deepsort weight.')
-            config = {"DEEPSORT": rospy.get_param("/DEEPSORT"))}
+            config = {"DEEPSORT": rospy.get_param(rospy.get_name())}
             self.deepsort = build_tracker(config, use_cuda=True)
             return
 
