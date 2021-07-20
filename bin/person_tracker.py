@@ -31,9 +31,7 @@ class VideoTracker(object):
         self.target_clear_srv = rospy.Service("~clear_target", clear_target, self.clear_track)
         self.target_choose_srv = rospy.Service("~choose_target", choose_target, self.select_target)
 
-        # concatenate rosparams to yolov3_deepsort style
-        config = {"DEEPSORT": rospy.get_param("/DEEPSORT")}
-        self.deepsort = build_tracker(config, use_cuda=True)
+        self.deepsort = None
 
         image_sub = message_filters.Subscriber('~image', CompressedImage)
         points_sub = message_filters.Subscriber("~points", PointCloud2)
@@ -95,6 +93,19 @@ class VideoTracker(object):
         return persons
 
     def ros_deepsort_callback(self, color, points, bbox):
+        if self.spencer_pub.get_num_connections() == 0 and self.image_pub.get_num_connections() == 0:
+            if self.deepsort is not None:
+                # Free gpu memory
+                del self.deepsort
+                self.deepsort = None
+            return
+        if self.deepsort is None:
+            # Only construct instance.
+            rospy.loginfo('loading deepsort weight.')
+            config = {"DEEPSORT": rospy.get_param("/DEEPSORT"))}
+            self.deepsort = build_tracker(config, use_cuda=True)
+            return
+
         # convert ros compressed image message to opencv
         np_arr = np.fromstring(color.data, np.uint8)
 
