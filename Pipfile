@@ -1,0 +1,26 @@
+[[source]]
+url = "https://pypi.org/simple"
+verify_ssl = true
+name = "pypi"
+
+[packages]
+numpy = "*"
+scipy = "*"
+opencv-python = "*"
+scikit-learn = "*"
+torch = "*"
+torchvision = "*"
+pillow = "*"
+vizer = "*"
+edict = "*"
+pyyaml = "*"
+easydict = "*"
+rospkg = "*"
+
+[requires]
+python_version = "3.6"
+
+[dev-packages]
+
+[scripts]
+launch = "roslaunch person_tracking person_tracker.launch"

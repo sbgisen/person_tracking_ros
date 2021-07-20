@@ -1,150 +1,52 @@
-#!/home/kl/torch_gpu_ros/bin/python
+#!/usr/bin/env python
 
-import os
 import cv2
-import time
-import argparse
 import torch
-import warnings
 import numpy as np
+
 import rospy
-import sys
+from darknet_ros_msgs.msg import BoundingBoxes
+import message_filters
+from sensor_msgs.msg import CompressedImage, PointCloud2
+import sensor_msgs.point_cloud2 as pc2
+from spencer_tracking_msgs.msg import DetectedPersons, DetectedPerson
 
-from detector import build_detector
 from deep_sort import build_tracker
+from person_tracking.srv import choose_target, clear_target
 from utils.draw import draw_boxes
-from utils.parser import get_config
-from utils.log import get_logger
-from utils.io import write_results
-
-from geometry_msgs.msg import Point
-from std_msgs.msg import Float32, Bool, Int32MultiArray, Int32
-from rospy.numpy_msg import numpy_msg
-from sensor_msgs.msg import CompressedImage
-
-from person_tracking.srv import choose_target, clear_target, update_tracker
 
 """
 args: display, img_topic, camera, save_results, video_path frame_interval, service
 
 """
 
+
 class VideoTracker(object):
-    def __init__(self, args):
+    def __init__(self):
+        # initialize publishers
+        self.image_pub = rospy.Publisher("~image/compressed", CompressedImage, queue_size=1)
+        self.spencer_pub = rospy.Publisher("~detected_persons", DetectedPersons, queue_size=1)
 
-        #get rosparams 
-        yolov3_params = rospy.get_param("/YOLOV3")
-        deepsort_params = rospy.get_param("/DEEPSORT")
-        
-        self.camera_fov = rospy.get_param("person_tracker/camera_fov")
-        self.results_path = rospy.get_param("person_tracker/video_save_path")
+        # initialize services to interact with node
+        self.target_clear_srv = rospy.Service("~clear_target", clear_target, self.clear_track)
+        self.target_choose_srv = rospy.Service("~choose_target", choose_target, self.select_target)
 
+        # concatenate rosparams to yolov3_deepsort style
+        config = {"DEEPSORT": rospy.get_param("/DEEPSORT")}
+        self.deepsort = build_tracker(config, use_cuda=True)
 
-        #initialize ros node to person_tracker name
-        rospy.init_node('person_tracker', anonymous=True)
-        rospy.loginfo('Video stream has started')
-
-        #initialize publishers
-        self.bbox_pub = rospy.Publisher("/person_tracking/bbox_center", Point, queue_size=1)
-        self.angle_pub = rospy.Publisher("/person_tracking/target_angle", Float32, queue_size=1)
-
-        self.target_present_pub = rospy.Publisher("/person_tracking/target_present", Bool, queue_size=1)
-        self.target_indice_pub = rospy.Publisher("/person_tracking/target_indice", Int32, queue_size=1)
-
-        self.detections_pub = rospy.Publisher("/person_tracking/detection_indices", Int32MultiArray, queue_size=1)
-
-        self.image_pub = rospy.Publisher("/person_tracking/deepsort_image/compressed", CompressedImage)
-
-        #initialize services to interact with node
-        self.target_clear_srv = rospy.Service("/person_tracking/clear_target", clear_target, self.clear_track)
-        self.target_choose_srv = rospy.Service("/person_tracking/choose_target", choose_target, self.select_target)
-
-        #concatenate rosparams to yolov3_deepsort style
-        self.cfg = {"YOLOV3": yolov3_params, "DEEPSORT": deepsort_params}
-        self.args = args
-
-        #TODO:default processing if no topic or webcam given: source is jiang_fam
-        if args.video_path:
-            self.video_path = args.video_path
-
-        self.logger = get_logger("root")
-
-        use_cuda = torch.cuda.is_available()
-        if not use_cuda:
-            warnings.warn("Running in cpu mode which maybe very slow!", UserWarning)
-
-        self.detector = build_detector(self.cfg, use_cuda=use_cuda)
-        self.deepsort = build_tracker(self.cfg, use_cuda=use_cuda)
-        self.class_names = self.detector.class_names
-        
-        if args.display:
-            cv2.namedWindow("test", cv2.WINDOW_NORMAL)
-            cv2.resizeWindow("test", args.display_width, args.display_height)
-
-        #subscribes to comprossed image topic if topic name is given, else provide service if service argument is given
-        if args.img_topic:
-            self.img_subscriber = rospy.Subscriber(args.img_topic, CompressedImage, self.ros_deepsort_callback,  queue_size = 1, buff_size=2**24)
-        elif args.service:
-            self.update_tracker_srv = rospy.Service("/person_tracking/update_tracker", update_tracker, self.ros_deepsort_callback)
-        #check if webcam is given if compressed image topic not given        
-        elif args.camera != -1:
-            print("Using webcam " + str(args.camera))
-            self.vdo = cv2.VideoCapture(args.camera)
-        #use video path
-        else:
-            self.vdo = cv2.VideoCapture()
-
-        if self.args.save_results:
-            os.makedirs(self.results_path, exist_ok=True)
-
-            # path of saved video and results
-            self.save_video_path = os.path.join(self.results_path, "results.avi")
-            self.save_results_path = os.path.join(self.results_path, "results.txt")
-
-            # create video writer
-            fourcc =  cv2.VideoWriter_fourcc(*'MJPG')
-            self.writer = cv2.VideoWriter(self.save_video_path, fourcc, 20, (640,480))
+        image_sub = message_filters.Subscriber('~image', CompressedImage)
+        points_sub = message_filters.Subscriber("~points", PointCloud2)
+        bbox_sub = message_filters.Subscriber('/darknet_ros/bounding_boxes', BoundingBoxes)
+        sub = message_filters.TimeSynchronizer([image_sub, points_sub, bbox_sub], 10)
+        sub.registerCallback(self.ros_deepsort_callback)
 
         self.idx_frame = 0
         self.idx_tracked = None
         self.bbox_xyxy = []
         self.identities = []
 
-    def __enter__(self):
-        if self.args.camera != -1:
-            ret, frame = self.vdo.read()
-            assert ret, "Error: Camera error"
-            self.im_width = frame.shape[0]
-            self.im_height = frame.shape[1]
-
-        else:
-            assert os.path.isfile(self.video_path), "Path error"
-            self.vdo.open(self.video_path)
-            self.im_width = int(self.vdo.get(cv2.CAP_PROP_FRAME_WIDTH))
-            self.im_height = int(self.vdo.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            assert self.vdo.isOpened()
-
-        if self.args.save_results:
-            os.makedirs(self.args.save_path, exist_ok=True)
-
-            # path of saved video and results
-            self.save_video_path = os.path.join(self.results_path, "results.avi")
-            self.save_results_path = os.path.join(self.results_path, "results.txt")
-
-            # create video writer
-            fourcc =  cv2.VideoWriter_fourcc(*'MJPG')
-            self.writer = cv2.VideoWriter(self.save_video_path, fourcc, 20, (self.im_width,self.im_height))
-
-            # logging
-            self.logger.info("Save results to {}".format(self.args.save_path))
-
-        return self
-
-    def __exit__(self, exc_type, exc_value, exc_traceback):
-        if exc_type:
-            print(exc_type, exc_value, exc_traceback)
-
-    #callback function to clear track
+    # callback function to clear track
     def clear_track(self, ros_data):
         if self.idx_tracked is not None and ros_data.clear:
             self.idx_tracked = None
@@ -152,93 +54,121 @@ class VideoTracker(object):
         else:
             return False
 
-
-    #callback function to select target
+    # callback function to select target
     def select_target(self, ros_data):
         if self.idx_tracked is None:
             for identity in self.identities:
                 if identity == ros_data.target:
                     self.idx_tracked = ros_data.target
                     return True
-            
             return False
         else:
             return False
 
-    def ros_deepsort_callback(self, ros_data):
+    def to_spencer_msg(self, detections, points, shape):
+        persons = DetectedPersons()
+        width, height = shape[:2]
+        for p in detections:
+            tlwh = self.deepsort._xyxy_to_tlwh(p[:4])
+            x, y = int(tlwh[0] + tlwh[2] / 2), int(tlwh[1] + tlwh[3] / 2)
+            centers = [[xx, yy] for yy in range(max(y - 3, 0), min(y + 3, height))
+                       for xx in range(max(x - 3, 0), min(x + 3, width))]
+            pts = [p for p in pc2.read_points(points, ('x', 'y', 'z'), uvs=centers)]
+            pt = np.mean(pts, axis=0)
+            person = DetectedPerson()
+            person.modality = DetectedPerson.MODALITY_GENERIC_RGBD
+            person.pose.pose.position.x = pt[0]
+            person.pose.pose.position.y = pt[1]
+            person.pose.pose.position.z = pt[2]
+            person.confidence = 0.5
+            person.detection_id = p[-1]
+            large_var = 999999999
+            pose_variance = 0.05
+            person.pose.covariance[0 * 6 + 0] = pose_variance
+            person.pose.covariance[1 * 6 + 1] = pose_variance
+            person.pose.covariance[2 * 6 + 2] = pose_variance
+            person.pose.covariance[3 * 6 + 3] = large_var
+            person.pose.covariance[4 * 6 + 4] = large_var
+            person.pose.covariance[5 * 6 + 5] = large_var
+            persons.detections.append(person)
 
-        start = time.time()
+        return persons
 
-        #convert ros compressed image message to opencv
-        if self.args.service:
-            np_arr = np.fromstring(ros_data.img.data, np.uint8)
-        elif self.args.img_topic:
-            np_arr = np.fromstring(ros_data.data, np.uint8)
+    def ros_deepsort_callback(self, color, points, bbox):
+        # convert ros compressed image message to opencv
+        np_arr = np.fromstring(color.data, np.uint8)
 
         ori_im = cv2.imdecode(np_arr, flags=cv2.IMREAD_COLOR)
         im = cv2.cvtColor(ori_im, cv2.COLOR_BGR2RGB)
 
-        #skip frame per frame interval
-        self.idx_frame += 1
-        if self.idx_frame % self.args.frame_interval:
-            return
-
         # do detection
-        bbox_xywh, cls_conf, cls_ids = self.detector(im)
+        bbox_xywh = []
+        cls_conf = []
+        cls_ids = []
+        for b in bbox.bounding_boxes:
+            bbox_xywh.append([b.x + b.w / 2, b.y + b.h / 2, b.w, b.h])
+            cls_conf.append(b.prob)
+            cls_ids.append(0 if 'person' in b.Class else 1)
+
+        if bbox_xywh:
+            bbox_xywh = np.array(bbox_xywh)
+            cls_conf = np.array(cls_conf)
+            cls_ids = np.array(cls_ids)
+        else:
+            bbox_xywh = torch.FloatTensor([]).reshape([0, 4]).numpy()
+            cls_conf = torch.FloatTensor([]).numpy()
+            cls_ids = torch.LongTensor([]).numpy()
 
         # select person class
-        mask = cls_ids==0
+        mask = cls_ids == 0
 
         bbox_xywh = bbox_xywh[mask]
         # bbox dilation just in case bbox too small, delete this line if using a better pedestrian detector
-        bbox_xywh[:,3:] *= 1.2 
+        bbox_xywh[:, 2:] *= 1.2
         cls_conf = cls_conf[mask]
 
         # do tracking
-        outputs = self.deepsort.update(bbox_xywh, cls_conf, im, tracking_target=self.idx_tracked)
-
+        outputs = self.deepsort.update(bbox_xywh, cls_conf, im, tracking_target=None)
 
         # if detection present draw bounding boxes
         if len(outputs) > 0:
             bbox_tlwh = []
-            self.bbox_xyxy = outputs[:,:4]
+            self.bbox_xyxy = outputs[:, :4]
             # detection indices
-            self.identities = outputs[:,-1]
+            self.identities = outputs[:, -1]
             ori_im = draw_boxes(ori_im, self.bbox_xyxy, self.identities)
 
             for bb_xyxy in self.bbox_xyxy:
                 bbox_tlwh.append(self.deepsort._xyxy_to_tlwh(bb_xyxy))
 
-        end = time.time()
-
-        #draw frame count
-        font                   = cv2.FONT_HERSHEY_SIMPLEX
-        bottomLeftCornerOfText = (10,500)
-        fontScale              = 1
-        fontColor              = (255,255,255)
-        lineType               = 2
+        # draw frame count
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        bottomLeftCornerOfText = (10, 500)
+        fontScale = 1
+        fontColor = (255, 255, 255)
+        lineType = 2
         frame_count = ("Frame no: %d" % self.idx_frame)
-        cv2.putText(ori_im,frame_count, 
-            bottomLeftCornerOfText, 
-            font, 
-            fontScale,
-            fontColor,
-            lineType)
-        #draw tracking number
+        cv2.putText(ori_im, frame_count,
+                    bottomLeftCornerOfText,
+                    font,
+                    fontScale,
+                    fontColor,
+                    lineType)
+        # draw tracking number
         if self.idx_tracked:
             tracking_str = ("Tracking: %d" % self.idx_tracked)
         else:
             tracking_str = ("Tracking: None")
 
-        bottomLeftCornerOfText = (10,550)
-        cv2.putText(ori_im,tracking_str, 
-            bottomLeftCornerOfText, 
-            font, 
-            fontScale,
-            fontColor,
-            lineType)
-        
-        #### Create CompressedIamge ####
+        bottomLeftCornerOfText = (10, 550)
+        cv2.putText(ori_im, tracking_str,
+                    bottomLeftCornerOfText,
+                    font,
+                    fontScale,
+                    fontColor,
+                    lineType)
+
+        # Create CompressedImage
         msg = CompressedImage()
         msg.header.stamp = rospy.Time.now()
         msg.format = "jpeg"
@@ -246,84 +176,18 @@ class VideoTracker(object):
         # Publish new image
         self.image_pub.publish(msg)
 
-        if self.args.save_results:
-            self.writer.write(ori_im)
-
-        # logging
-        self.logger.info("frame: {}, time: {:.03f}s, fps: {:.03f}, detection numbers: {}, tracking numbers: {}" \
-                        .format(self.idx_frame, end-start, 1/(end-start), bbox_xywh.shape[0], len(outputs)))
-    
         """publishing to topics"""
-        #publish detection identities
-        identity_msg = Int32MultiArray(data=self.identities)
-        self.detections_pub.publish(identity_msg)
-
-        #publish if target present
-        if len(outputs) == 0 or self.idx_tracked is None:
-            self.target_present_pub.publish(Bool(False))
-        elif len(outputs) > 0 and self.idx_tracked:
-            self.target_present_pub.publish(Bool(True))
+        msg = self.to_spencer_msg(outputs, points, im.shape)
+        msg.header = points.header
+        self.spencer_pub.publish(msg)
 
 
-        #publish angle and xy data
-        if self.idx_tracked is not None:
-
-            x_center = (self.bbox_xyxy[0][0] + self.bbox_xyxy[0][2])/2
-            y_center = (self.bbox_xyxy[0][1] + self.bbox_xyxy[0][3])/2
-
-            pixel_per_angle = im.shape[1]/self.camera_fov
-
-            x_center_adjusted = x_center - (im.shape[1]/2)
-            #print(x_center_adjusted)
-            angle = x_center_adjusted/pixel_per_angle
-            #print(angle)
-            if self.args.img_topic:
-                self.bbox_pub.publish(x_center,y_center,0)
-
-            self.angle_pub.publish(angle)
-            self.target_indice_pub.publish(Int32(self.idx_tracked))
-        
-            msg = Point()
-            msg.x = x_center
-            msg.y = y_center
-            msg.z = 0
-            return msg
-        #publish if target initialized
-        else:
-            self.target_indice_pub.publish(Int32(self.idx_tracked))
-            msg = Point()
-            msg.x = 0
-            msg.y = 0
-            msg.z = 0
-            return msg
-    #TODO: function for if no ros topic
-   # def run(self):
-
-def parse_args():
-    
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--video_path", type=str, default=None)
-    parser.add_argument("--display", action="store_true")
-    parser.add_argument("--frame_interval", type=int, default=1)
-    parser.add_argument("--display_width", type=int, default=800)
-    parser.add_argument("--display_height", type=int, default=600)
-    parser.add_argument("--save_results", action="store_true")
-    parser.add_argument("--camera", type=int, default="-1")
-    parser.add_argument("--img_topic", type=str)
-    parser.add_argument("--service", action="store_true")
-
-    return parser.parse_known_args()
-            
-def main(args):
+def main():
     '''Initializes and cleanup ros node'''
-    person_tracker = VideoTracker(args)
-    rospy.init_node('person_tracker', anonymous=True)
-    try:
-        rospy.spin()
-    except KeyboardInterrupt:
-        print("Shutting down ROS tracker")
+    rospy.init_node('person_reid', anonymous=True)
+    _ = VideoTracker()
+    rospy.spin()
 
 
-if __name__=="__main__":
-    args, unknown = parse_args()
-    main(args)
+if __name__ == "__main__":
+    main()
