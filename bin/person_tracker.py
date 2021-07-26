@@ -71,7 +71,7 @@ class VideoTracker(object):
         height, width = shape[:2]
         for p, conf in zip(detections, cls_conf):
             tlwh = self.deepsort._xyxy_to_tlwh(p[:4])
-            x, y = int(tlwh[0] + tlwh[2] / 2), int(tlwh[1] + tlwh[3] / 2)
+            x, y = int(tlwh[0] + tlwh[2] / 2.0), int(tlwh[1] + tlwh[3] / 2.0)
             centers = [[xx, yy] for yy in range(max(y - 3, 0), min(y + 3, height))
                        for xx in range(max(x - 3, 0), min(x + 3, width))]
             pts = [p for p in pc2.read_points(points, ('x', 'y', 'z'), uvs=centers)]
