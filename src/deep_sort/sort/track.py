@@ -156,7 +156,7 @@ class Track:
         """
         if self.state == TrackState.Tentative:
             self.state = TrackState.Deleted
-        elif self.time_since_update > self._max_age and self.no_destroy == False:
+        elif (self.time_since_update > self._max_age or self.time_since_update > self.hits * 3) and self.no_destroy == False:
             self.state = TrackState.Deleted
 
     def is_tentative(self):

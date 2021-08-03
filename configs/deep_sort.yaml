@@ -1,3 +1,7 @@
+image_topic: "/color/image_raw/compressed"
+points_topic: "/depth_registered/points"
+yolo_topic: "/darknet_ros/bounding_boxes"
+
 #DISTANCE: euclidean or cosine
 
 #STOCK REID

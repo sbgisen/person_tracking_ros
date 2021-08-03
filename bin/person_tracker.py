@@ -36,11 +36,20 @@ class VideoTracker(object):
 
         self.deepsort = None
 
-        image_sub = message_filters.Subscriber('~image', CompressedImage)
-        points_sub = message_filters.Subscriber("~points", PointCloud2)
-        bbox_sub = message_filters.Subscriber('/darknet_ros/bounding_boxes', BoundingBoxes)
-        sub = message_filters.TimeSynchronizer([image_sub, points_sub, bbox_sub], 10)
-        sub.registerCallback(self.ros_deepsort_callback)
+        self.stored_msgs = {}
+        camera_namespaces = rospy.get_param('~camera_namespaces')
+        image_topic = rospy.get_param('~image_topic')
+        points_topic = rospy.get_param('~points_topic')
+        yolo_topic = rospy.get_param('~yolo_topic')
+        for i, ns in enumerate(camera_namespaces):
+            image_sub = message_filters.Subscriber(ns + image_topic, CompressedImage)
+            points_sub = message_filters.Subscriber(ns + points_topic, PointCloud2)
+            bbox_sub = message_filters.Subscriber(ns + yolo_topic, BoundingBoxes)
+            sub = message_filters.TimeSynchronizer([image_sub, points_sub, bbox_sub], 10)
+            if i == 0:
+                sub.registerCallback(self.ros_deepsort_callback)
+            else:
+                sub.registerCallback(self.store_detection)
 
         self.idx_frame = 0
         self.idx_tracked = None
@@ -74,7 +83,9 @@ class VideoTracker(object):
             x, y = int(tlwh[0] + tlwh[2] / 2.0), int(tlwh[1] + tlwh[3] / 2.0)
             centers = [[xx, yy] for yy in range(max(y - 3, 0), min(y + 3, height))
                        for xx in range(max(x - 3, 0), min(x + 3, width))]
-            pts = [p for p in pc2.read_points(points, ('x', 'y', 'z'), uvs=centers)]
+            pts = [p for p in pc2.read_points(points, ('x', 'y', 'z'), uvs=centers, skip_nans=True)]
+            if not pts:
+                continue
             pt = np.mean(pts, axis=0)
             person = DetectedPerson()
             person.modality = DetectedPerson.MODALITY_GENERIC_RGBD
@@ -97,6 +108,9 @@ class VideoTracker(object):
 
         return persons
 
+    def store_detection(self, color, points, bbox):
+        self.stored_msgs[points.header.frame_id] = [color, points, bbox]
+
     def ros_deepsort_callback(self, color, points, bbox):
         if self.spencer_pub.get_num_connections() == 0 and self.image_pub.get_num_connections() == 0:
             if self.deepsort is not None:
@@ -111,40 +125,49 @@ class VideoTracker(object):
             self.deepsort = build_tracker(config, use_cuda=True)
             return
 
-        # convert ros compressed image message to opencv
-        np_arr = np.fromstring(color.data, np.uint8)
+        ori_im = cv2.imdecode(np.fromstring(color.data, np.uint8), flags=cv2.IMREAD_COLOR)
 
-        ori_im = cv2.imdecode(np_arr, flags=cv2.IMREAD_COLOR)
-        im = cv2.cvtColor(ori_im, cv2.COLOR_BGR2RGB)
+        bbox_xywhs = []
+        cls_confs = []
+        ims = []
+        self.store_detection(color, points, bbox)
+        for c, _, b in self.stored_msgs.values():
 
-        # do detection
-        bbox_xywh = []
-        cls_conf = []
-        cls_ids = []
-        for b in bbox.bounding_boxes:
-            bbox_xywh.append([b.x + b.w / 2, b.y + b.h / 2, b.w, b.h])
-            cls_conf.append(b.prob)
-            cls_ids.append(0 if 'person' in b.Class else 1)
+            # convert ros compressed image message to opencv
+            np_arr = np.fromstring(c.data, np.uint8)
+            im = cv2.cvtColor(cv2.imdecode(np_arr, flags=cv2.IMREAD_COLOR), cv2.COLOR_BGR2RGB)
 
-        if bbox_xywh:
-            bbox_xywh = np.array(bbox_xywh)
-            cls_conf = np.array(cls_conf)
-            cls_ids = np.array(cls_ids)
-        else:
-            bbox_xywh = torch.FloatTensor([]).reshape([0, 4]).numpy()
-            cls_conf = torch.FloatTensor([]).numpy()
-            cls_ids = torch.LongTensor([]).numpy()
+            # do detection
+            bbox_xywh = []
+            cls_conf = []
+            cls_ids = []
+            for bb in b.bounding_boxes:
+                bbox_xywh.append([bb.x + bb.w / 2, bb.y + bb.h / 2, bb.w, bb.h])
+                cls_conf.append(bb.prob)
+                cls_ids.append(0 if 'person' in bb.Class else 1)
 
-        # select person class
-        mask = cls_ids == 0
+            if bbox_xywh:
+                bbox_xywh = np.array(bbox_xywh)
+                cls_conf = np.array(cls_conf)
+                cls_ids = np.array(cls_ids)
+            else:
+                bbox_xywh = torch.FloatTensor([]).reshape([0, 4]).numpy()
+                cls_conf = torch.FloatTensor([]).numpy()
+                cls_ids = torch.LongTensor([]).numpy()
 
-        bbox_xywh = bbox_xywh[mask]
-        # bbox dilation just in case bbox too small, delete this line if using a better pedestrian detector
-        bbox_xywh[:, 2:] *= 1.2
-        cls_conf = cls_conf[mask]
+            # select person class
+            mask = cls_ids == 0
+
+            bbox_xywh = bbox_xywh[mask]
+            # bbox dilation just in case bbox too small, delete this line if using a better pedestrian detector
+            bbox_xywh[:, 2:] *= 1.2
+            cls_conf = cls_conf[mask]
+            bbox_xywhs.append(bbox_xywh)
+            cls_confs.append(cls_conf)
+            ims.append(im)
 
         # do tracking
-        outputs = self.deepsort.update(bbox_xywh, cls_conf, im, tracking_target=None)
+        outputs = self.deepsort.update(bbox_xywhs, cls_confs, ims, tracking_target=None)
 
         # if detection present draw bounding boxes
         if len(outputs) > 0:
