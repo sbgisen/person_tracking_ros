@@ -4,15 +4,26 @@ import numpy as np
 import cv2
 import logging
 
-from .face_feature_extractor import FaceExtractor
-from .reid_feature_extractor import ReidExtractor
+from .model import Net
 
-class FeatureExtractor(object):
-    def __init__(self, use_cuda=True):
-        self.face_extractor = FaceExtractor()
-        self.reid_extractor = ReidExtractor()
 
-    def _preprocess(self, im_crops_tuple):
+class Extractor(object):
+    def __init__(self, model_path, use_cuda=True):
+        self.net = Net(reid=True)
+        self.device = "cuda" if torch.cuda.is_available() and use_cuda else "cpu"
+        state_dict = torch.load(model_path, map_location=torch.device(self.device))[
+            'net_dict']
+        self.net.load_state_dict(state_dict)
+        logger = logging.getLogger("root.tracker")
+        logger.info("Loading weights from {}... Done!".format(model_path))
+        self.net.to(self.device)
+        self.size = (64, 128)
+        self.norm = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+        ])
+
+    def _preprocess(self, im_crops):
         """
         TODO:
             1. to float with scale from 0 to 1
@@ -23,35 +34,21 @@ class FeatureExtractor(object):
         """
         def _resize(im, size):
             return cv2.resize(im.astype(np.float32)/255., size)
-        
-        im_batch = torch.cat([self.norm(_resize(im, self.size)).unsqueeze(0) for im in im_crops], dim=0)
-        im_batch = im_batch.float()
-        #print(im_batch.shape)
+
+        im_batch = torch.cat([self.norm(_resize(im, self.size)).unsqueeze(
+            0) for im in im_crops], dim=0).float()
         return im_batch
 
-    
-    def __call__(self, im_crops_tuple):
-        unzip_tuples = [list(t) for t in zip(*tuples_list)]
-        im_crops_face = np.array(unzip_tuples[1])
-        im_crops_body = np.array(unzip_tuples[1])
-        
-        features_body = ReidExtractor(im_crops_body)
-        features_face = FaceExtractor(im_crops_face)
-
-        zipped_features = zip()
-
+    def __call__(self, im_crops):
+        im_batch = self._preprocess(im_crops)
+        with torch.no_grad():
+            im_batch = im_batch.to(self.device)
+            features = self.net(im_batch)
         return features.cpu().numpy()
 
 
 if __name__ == '__main__':
-    img = cv2.imread("./pictures/margo2_cropped.jpg")[:,:,(2,1,0)]
-    img2 = cv2.imread("./pictures/margo1_cropped.jpg")[:,:,(2,1,0)]
-    img3 = cv2.imread("./pictures/tom1_cropped.jpg")[:,:,(2,1,0)]
-
-    extr = FaceExtractor()
-    feature = extr([img, img2, img3])
-    #print(feature[0].shape)
-    a = np.asarray(feature) / np.linalg.norm(feature, axis=1, keepdims=True)
-    b = np.asarray(feature) / np.linalg.norm(feature, axis=1, keepdims=True)
-    cos_dist= 1. - np.dot(a, b.T)
-    print(cos_dist)
+    img = cv2.imread("demo.jpg")[:, :, (2, 1, 0)]
+    extr = Extractor("checkpoint/ckpt.t7")
+    feature = extr(img)
+    print(feature.shape)

@@ -142,3 +142,7 @@ To clear a target, run the following command.
 rosservice call /person_tracking/clear_target true
 ```
 Service will return **True** if track is successfully cleared.
+
+
+## another impl
+https://github.com/ZQPei/deep_sort_pytorch

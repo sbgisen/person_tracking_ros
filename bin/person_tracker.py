@@ -45,16 +45,18 @@ class VideoTracker(object):
             image_sub = message_filters.Subscriber(ns + image_topic, CompressedImage)
             points_sub = message_filters.Subscriber(ns + points_topic, PointCloud2)
             bbox_sub = message_filters.Subscriber(ns + yolo_topic, BoundingBoxes)
-            sub = message_filters.TimeSynchronizer([image_sub, points_sub, bbox_sub], 10)
-            if i == 0:
-                sub.registerCallback(self.ros_deepsort_callback)
-            else:
-                sub.registerCallback(self.store_detection)
+            sub = message_filters.ApproximateTimeSynchronizer([image_sub, points_sub, bbox_sub], 10, 0.1)
+            # if i == 0:
+            #     sub.registerCallback(self.ros_deepsort_callback)
+            # else:
+            sub.registerCallback(self.store_detection)
 
         self.idx_frame = 0
         self.idx_tracked = None
         self.bbox_xyxy = []
         self.identities = []
+
+        self.__no_published_count = 0
 
     # callback function to clear track
     def clear_track(self, ros_data):
@@ -87,13 +89,14 @@ class VideoTracker(object):
             if not pts:
                 continue
             pt = np.mean(pts, axis=0)
+            # TODO: TFをodomにしてzを0にしたほうがいいかも
             person = DetectedPerson()
             person.modality = DetectedPerson.MODALITY_GENERIC_RGBD
             person.pose.pose.position.x = pt[0]
             person.pose.pose.position.y = pt[1]
             person.pose.pose.position.z = pt[2]
             person.confidence = conf
-            person.reidentification_id = p[-1]
+            person.reidentification_id = p[4]
             person.detection_id = self.last_detection_id
             self.last_detection_id += self.detection_id_increment
             large_var = 999999999
@@ -110,13 +113,21 @@ class VideoTracker(object):
 
     def store_detection(self, color, points, bbox):
         self.stored_msgs[points.header.frame_id] = [color, points, bbox]
+        self.__no_published_count = 0
 
-    def ros_deepsort_callback(self, color, points, bbox):
-        if self.spencer_pub.get_num_connections() == 0 and self.image_pub.get_num_connections() == 0:
+    # def ros_deepsort_callback(self, color, points, bbox):
+    def ros_deepsort_callback(self):
+        # not_subscribed = self.spencer_pub.get_num_connections() == 0 and self.image_pub.get_num_connections() == 0
+        if self.__no_published_count > 15:
             if self.deepsort is not None:
                 # Free gpu memory
                 del self.deepsort
                 self.deepsort = None
+                torch.cuda.empty_cache()
+                rospy.signal_shutdown('respawn to clean gpu memory')
+            return
+        if not self.stored_msgs:
+            self.__no_published_count += 1
             return
         if self.deepsort is None:
             # Only construct instance.
@@ -124,57 +135,35 @@ class VideoTracker(object):
             config = {"DEEPSORT": rospy.get_param(rospy.get_name())}
             self.deepsort = build_tracker(config, use_cuda=True)
             return
+        color, points, bbox = list(self.stored_msgs.values())[-1]
+        del(self.stored_msgs[list(self.stored_msgs.keys())[-1]])
 
         ori_im = cv2.imdecode(np.fromstring(color.data, np.uint8), flags=cv2.IMREAD_COLOR)
 
-        bbox_xywhs = []
-        cls_confs = []
-        ims = []
-        self.store_detection(color, points, bbox)
-        for c, _, b in self.stored_msgs.values():
+        xywhs = []
+        confs = []
+        clss = []
+        # ims = []
+        # convert ros compressed image message to opencv
+        np_arr = np.fromstring(color.data, np.uint8)
+        im0 = cv2.cvtColor(cv2.imdecode(np_arr, flags=cv2.IMREAD_COLOR), cv2.COLOR_BGR2RGB)
+        for bb in bbox.bounding_boxes:
+            if 'person' in bb.Class:
+                xywhs.append([bb.x + bb.w / 2, bb.y + bb.h / 2, bb.w, bb.h])
+                confs.append(bb.prob)
+                clss.append(int(0))
 
-            # convert ros compressed image message to opencv
-            np_arr = np.fromstring(c.data, np.uint8)
-            im = cv2.cvtColor(cv2.imdecode(np_arr, flags=cv2.IMREAD_COLOR), cv2.COLOR_BGR2RGB)
-
-            # do detection
-            bbox_xywh = []
-            cls_conf = []
-            cls_ids = []
-            for bb in b.bounding_boxes:
-                bbox_xywh.append([bb.x + bb.w / 2, bb.y + bb.h / 2, bb.w, bb.h])
-                cls_conf.append(bb.prob)
-                cls_ids.append(0 if 'person' in bb.Class else 1)
-
-            if bbox_xywh:
-                bbox_xywh = np.array(bbox_xywh)
-                cls_conf = np.array(cls_conf)
-                cls_ids = np.array(cls_ids)
-            else:
-                bbox_xywh = torch.FloatTensor([]).reshape([0, 4]).numpy()
-                cls_conf = torch.FloatTensor([]).numpy()
-                cls_ids = torch.LongTensor([]).numpy()
-
-            # select person class
-            mask = cls_ids == 0
-
-            bbox_xywh = bbox_xywh[mask]
-            # bbox dilation just in case bbox too small, delete this line if using a better pedestrian detector
-            bbox_xywh[:, 2:] *= 1.2
-            cls_conf = cls_conf[mask]
-            bbox_xywhs.append(bbox_xywh)
-            cls_confs.append(cls_conf)
-            ims.append(im)
-
-        # do tracking
-        outputs = self.deepsort.update(bbox_xywhs, cls_confs, ims, tracking_target=None)
-
+        outputs = []
+        if xywhs:
+            outputs = self.deepsort.update(np.array(xywhs), np.array(confs), np.array(clss), im0)
+        else:
+            self.deepsort.increment_ages()
         # if detection present draw bounding boxes
         if len(outputs) > 0:
             bbox_tlwh = []
             self.bbox_xyxy = outputs[:, :4]
             # detection indices
-            self.identities = outputs[:, -1]
+            self.identities = outputs[:, 4]
             ori_im = draw_boxes(ori_im, self.bbox_xyxy, self.identities)
 
             for bb_xyxy in self.bbox_xyxy:
@@ -216,7 +205,7 @@ class VideoTracker(object):
         self.image_pub.publish(msg)
 
         """publishing to topics"""
-        msg = self.to_spencer_msg(outputs, cls_conf, points, im.shape)
+        msg = self.to_spencer_msg(outputs, confs, points, im0.shape)
         msg.header = points.header
         self.spencer_pub.publish(msg)
 
@@ -224,8 +213,11 @@ class VideoTracker(object):
 def main():
     '''Initializes and cleanup ros node'''
     rospy.init_node('person_reid', anonymous=True)
-    _ = VideoTracker()
-    rospy.spin()
+    node = VideoTracker()
+    rate = rospy.Rate(15)
+    while not rospy.is_shutdown():
+        rate.sleep()
+        node.ros_deepsort_callback()
 
 
 if __name__ == "__main__":

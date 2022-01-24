@@ -1,13 +1,13 @@
 <launch>
-  <arg name="camera_namespaces" default="[/realsense_front, /realsense_rear]" />
-  <arg name="detection_id_increment" default="20" />
-  <arg name="detection_id_offset" default="7" />
-  <node name="person_reid" pkg="person_tracking" type="person_tracker.py" output="screen">
-    <param name="REID_CKPT" type="string" value="$(find person_tracking)/src/weights/model.pth.tar-100" />
-    <rosparam param="camera_namespaces" subst_value="True">$(arg camera_namespaces)</rosparam>
-    <rosparam file="$(find person_tracking)/configs/deep_sort.yaml" />
-    <param name="detection_id_increment" value="$(arg detection_id_increment)" />
-    <param name="detection_id_offset" value="$(arg detection_id_offset)" />
+  <arg name="camera_namespaces" default="[/realsense_front, /realsense_rear]"/>
+  <arg name="detection_id_increment" default="20"/>
+  <arg name="detection_id_offset" default="7"/>
+  <node name="person_reid" pkg="person_tracking" type="person_tracker.py" output="screen" respawn="true">
+    <param name="REID_CKPT" type="string" value="$(find person_tracking)/src/weights/ckpt.t7"/>
+    <rosparam param="camera_namespaces" subst_value="true">$(arg camera_namespaces)</rosparam>
+    <rosparam file="$(find person_tracking)/configs/deep_sort.yaml"/>
+    <param name="detection_id_increment" value="$(arg detection_id_increment)"/>
+    <param name="detection_id_offset" value="$(arg detection_id_offset)"/>
   </node>
 
 

@@ -1,8 +1,8 @@
 # vim: expandtab:ts=4:sw=4
 from __future__ import absolute_import
 import numpy as np
-import torch
 from . import linear_assignment
+
 
 def iou(bbox, candidates):
     """Computer intersection over union.
@@ -76,46 +76,7 @@ def iou_cost(tracks, detections, track_indices=None,
             continue
 
         bbox = tracks[track_idx].to_tlwh()
-        candidates = np.asarray([detections[i].tlwh for i in detection_indices])
+        candidates = np.asarray(
+            [detections[i].tlwh for i in detection_indices])
         cost_matrix[row, :] = 1. - iou(bbox, candidates)
     return cost_matrix
-
-def _xywh_to_tlwh(bbox_xywh):
-    if isinstance(bbox_xywh, np.ndarray):
-        bbox_tlwh = bbox_xywh.copy()
-    elif isinstance(bbox_xywh, torch.Tensor):
-        bbox_tlwh = bbox_xywh.clone()
-    bbox_tlwh[:,0] = bbox_xywh[:,0] - bbox_xywh[:,2]/2.
-    bbox_tlwh[:,1] = bbox_xywh[:,1] - bbox_xywh[:,3]/2.
-    return bbox_tlwh
-
-def iou_cost_faces(faces_bbox, bodies_bbox):
-    """An intersection over union distance metric for matching faces with bodies.
-
-    Parameters
-    ----------
-    faces_bbox : List[List[int]]
-        A list of bboxes of faces.
-    bodies_bbox : List[List[int]]
-        A list of bboxes of bodies.
-
-    Returns
-    -------
-    ndarray
-        Returns a cost matrix of face IOU where if face i is fully inside 
-        person bbox j, cost_matrix[i,j]=0, else if its not fully inside,
-        cost_matrix[i,j]=1
-
-    """
-
-    cost_matrix = np.zeros((len(faces_bbox), len(bodies_bbox)))
-    faces_bbox = _xywh_to_tlwh(faces_bbox)
-    bodies_bbox = _xywh_to_tlwh(bodies_bbox)
-    for i, face in enumerate(faces_bbox):
-        candidates = bodies_bbox
-        cost_matrix[i, :] = 1. - iou(face, candidates)
-        cost_matrix[cost_matrix != 0] = 1
-
-    cost_matrix = cost_matrix.transpose()
-    return cost_matrix
-

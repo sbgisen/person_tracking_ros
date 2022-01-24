@@ -63,14 +63,16 @@ class Track:
 
     """
 
-    def __init__(self, mean, covariance, track_id, n_init, max_age,
+    def __init__(self, mean, covariance, track_id, class_id, n_init, max_age,
                  feature=None):
         self.mean = mean
         self.covariance = covariance
         self.track_id = track_id
+        self.class_id = class_id
         self.hits = 1
         self.age = 1
         self.time_since_update = 0
+        self.yolo_bbox = [0, 0, 0, 0]
 
         self.state = TrackState.Tentative
         self.features = []
@@ -79,8 +81,6 @@ class Track:
 
         self._n_init = n_init
         self._max_age = max_age
-
-        self.no_destroy = False
 
     def to_tlwh(self):
         """Get current position in bounding box format `(top left x, top left y,
@@ -98,18 +98,33 @@ class Track:
         return ret
 
     def to_tlbr(self):
-        """Get current position in bounding box format `(min x, miny, max x,
+        """Get kf estimated current position in bounding box format `(min x, miny, max x,
         max y)`.
 
         Returns
         -------
         ndarray
-            The bounding box.
+            The predicted kf bounding box.
 
         """
         ret = self.to_tlwh()
         ret[2:] = ret[:2] + ret[2:]
         return ret
+
+    def get_yolo_pred(self):
+        """Get yolo prediction`.
+
+        Returns
+        -------
+        ndarray
+            The yolo bounding box.
+
+        """
+        return self.yolo_bbox
+
+    def increment_age(self):
+        self.age += 1
+        self.time_since_update += 1
 
     def predict(self, kf):
         """Propagate the state distribution to the current time step using a
@@ -121,15 +136,10 @@ class Track:
             The Kalman filter.
 
         """
-        if self.time_since_update < self._max_age and self.no_destroy == False:
-            self.mean, self.covariance = kf.predict(self.mean, self.covariance)
-        elif self.time_since_update < 50 and self.no_destroy == True:
-            self.mean, self.covariance = kf.predict(self.mean, self.covariance)
+        self.mean, self.covariance = kf.predict(self.mean, self.covariance)
+        self.increment_age()
 
-        self.age += 1
-        self.time_since_update += 1
-
-    def update(self, kf, detection):
+    def update(self, kf, detection, class_id):
         """Perform Kalman filter measurement update step and update the feature
         cache.
 
@@ -141,10 +151,11 @@ class Track:
             The associated detection.
 
         """
-
+        self.yolo_bbox = detection
         self.mean, self.covariance = kf.update(
             self.mean, self.covariance, detection.to_xyah())
         self.features.append(detection.feature)
+        self.class_id = class_id
 
         self.hits += 1
         self.time_since_update = 0
@@ -156,7 +167,7 @@ class Track:
         """
         if self.state == TrackState.Tentative:
             self.state = TrackState.Deleted
-        elif (self.time_since_update > self._max_age or self.time_since_update > self.hits * 3) and self.no_destroy == False:
+        elif self.time_since_update > self._max_age:
             self.state = TrackState.Deleted
 
     def is_tentative(self):
